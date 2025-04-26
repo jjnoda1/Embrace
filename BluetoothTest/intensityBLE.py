@@ -3,7 +3,7 @@ import subprocess
 import time
 import wave
 import numpy as np
-from scipy.signal import butter, lfilter
+from scipy.signal import butter, lfilter, savgol_filter
 from bleak import BleakClient, BleakScanner
 
 SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
@@ -13,132 +13,134 @@ def butter_bandpass(lowcut, highcut, fs, order=2):
     nyq = 0.5 * fs
     low = lowcut / nyq
     high = highcut / nyq
-    b, a = butter(order, [low, high], btype='band')
-    return b, a
+    return butter(order, [low, high], btype='band')
 
 def bandpass_filter(data, lowcut, highcut, fs, order=2):
     b, a = butter_bandpass(lowcut, highcut, fs, order=order)
     return lfilter(b, a, data)
 
-def extract_peak_envelope(audio, sample_rate, window_ms=50):
+def extract_rms_envelope(audio, sample_rate, window_ms=250):
     window_size = int(sample_rate * window_ms / 1000)
-    n_windows = len(audio) // window_size 
-    peaks = []
+    n_windows = len(audio) // window_size
+    rms_vals = []
     for i in range(n_windows):
         start = i * window_size
-        window = audio[start : start + window_size]
-        peak = np.max(np.abs(window))
-        peaks.append(peak)
-    return np.array(peaks)
+        w = audio[start:start+window_size]
+        rms_vals.append(np.sqrt(np.mean(w**2)))
+    return np.array(rms_vals)
 
 async def stream_bass_envelope(wav_file):
-    print("Processing WAV file to extract envelope values...")
+    print("Processing WAV file…")
     wf = wave.open(wav_file, "rb")
     fs = wf.getframerate()
-    sampwidth = wf.getsampwidth()
-    num_frames = wf.getnframes()
-    raw_data = wf.readframes(num_frames)
+    nch = wf.getnchannels()
+    sampw = wf.getsampwidth()
+    n_frames = wf.getnframes()
+    data = wf.readframes(n_frames)
     wf.close()
-    
-    #This is GPT code lol
-    # Convert raw audio data to float and normalize based on sample width.
-    if sampwidth == 1:
-        # 8-bit PCM: unsigned [0,255] -> convert to [-1,1]
-        audio = np.frombuffer(raw_data, dtype=np.uint8).astype(np.float32)
-        audio = (audio - 128.0) / 127.0
-    elif sampwidth == 2:
-        # 16-bit PCM: signed [-32768,32767] -> normalize to [-1,1]
-        audio = np.frombuffer(raw_data, dtype=np.int16).astype(np.float32)
-        audio = audio / 32768.0
-    else:
-        print("Unsupported sample width:", sampwidth)
-        return []
-    
-    print("Audio min, max:", audio.min(), audio.max())
-    
-    # isolate bass by bandpass filters
-    bass_audio = bandpass_filter(audio, lowcut=20, highcut=200, fs=fs, order=2)
-    bass_audio = np.nan_to_num(bass_audio)
-    print("Bass audio min, max:", bass_audio.min(), bass_audio.max())
-    
-    # extract peak in 50ms windows
-    envelope = extract_peak_envelope(bass_audio, fs, window_ms=50)
-    print("Raw envelope values:", envelope)
-    
-    # apply gain
-    gain = 100.0
-    envelope = envelope * gain
-    
-    # use square-root scaling to enhance difference
-    envelope_sqrt = np.sqrt(np.abs(envelope))
-    
-    # normalize square-root values to range (0-255)
-    # need to refine for better playback
-    min_val = envelope_sqrt.min()
-    max_val = envelope_sqrt.max()
-    if max_val - min_val > 0:
-        envelope_norm = np.clip((envelope_sqrt - min_val) / (max_val - min_val) * 255, 0, 255).astype(np.uint8)
-    else:
-        envelope_norm = np.zeros_like(envelope_sqrt, dtype=np.uint8)
-    
-    print("Normalized envelope values:", envelope_norm)
-    return envelope_norm
 
-async def send_envelope_values(envelope_values, playback_event):
-    print("Scanning for ESP32...")
+    if sampw == 1:
+        audio = np.frombuffer(data, dtype=np.uint8).astype(np.float32)
+        audio = (audio - 128.0) / 127.0
+    elif sampw == 2:
+        audio = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+    else:
+        print("Unsupported sample width:", sampw)
+        return np.array([])
+
+    if nch > 1:
+        audio = audio.reshape(-1, nch).mean(axis=1)
+
+    print(f"Rate: {fs}Hz, Channels: {nch}, Samples: {len(audio)}")
+
+    bass = bandpass_filter(audio, 20, 200, fs, order=2)
+    bass = np.nan_to_num(bass)
+
+    env = extract_rms_envelope(bass, fs, window_ms=250)
+    print("Raw RMS envelope:", env)
+
+    gain = 10.0
+    env_s = np.sqrt(env * gain)
+    mn, mx = env_s.min(), env_s.max()
+    if mx > mn:
+        norm = ((env_s - mn) / (mx - mn) * 255).clip(0,255).astype(np.uint8)
+    else:
+        norm = np.zeros_like(env_s, dtype=np.uint8)
+
+    if len(norm) >= 7:
+        smooth1 = savgol_filter(norm, 7, 2).astype(np.uint8)
+    else:
+        smooth1 = norm
+
+    alpha = 0.2
+    smooth2 = np.zeros_like(smooth1, dtype=np.float32)
+    smooth2[0] = smooth1[0]
+    for i in range(1, len(smooth1)):
+        smooth2[i] = alpha * smooth1[i] + (1-alpha) * smooth2[i-1]
+
+    final_env = smooth2.clip(0,255).astype(np.uint8)
+
+    final_env -= 50
+    print("Final smoothed envelope:", final_env)
+    return final_env
+
+async def send_envelope_values(env_vals, playback_event):
+    print("Scanning for ESP32…")
     devices = await BleakScanner.discover()
-    target = None
-    for d in devices:
-        if d.name and "ESP32" in d.name:
-            target = d
-            break
+    target  = next((d for d in devices if d.name and "ESP32" in d.name), None)
     if not target:
-        print("ESP32 device not found!")
+        print("ESP32 not found")
         return
 
     async with BleakClient(target.address) as client:
-        print(f"Connected to {target.name}")
-        # signal that BLE connected and ready
+        print("Connected to", target.name)
         playback_event.set()
-        interval = 0.05  # 50 ms per envelope value
-        start_time = asyncio.get_event_loop().time()
-        for i, intensity in enumerate(envelope_values):
-            scheduled_time = start_time + i * interval
+        interval = 0.25
+        start = asyncio.get_event_loop().time()
+
+        for i, val in enumerate(env_vals):
+            sched = start + i*interval
             now = asyncio.get_event_loop().time()
-            sleep_time = scheduled_time - now
-            if sleep_time > 0:
-                await asyncio.sleep(sleep_time)
-            print("Sending intensity:", intensity)
-            # write (don't wait for response to keep timing right)
-            await client.write_gatt_char(BASS_CHAR_UUID, bytes([intensity]), response=False)
-        # wait for end
-        total_duration = len(envelope_values) * interval
-        final_time = start_time + total_duration
+            if sched > now:
+                await asyncio.sleep(sched - now)
+            print("Send:", val)
+            await client.write_gatt_char(BASS_CHAR_UUID, bytes([val]), response=False)
+
+        # ensure we waited
+        total = len(env_vals) * interval
+        endt = start + total
         now = asyncio.get_event_loop().time()
-        if final_time - now > 0:
-            await asyncio.sleep(final_time - now)
-        # send 0 to stop motor
-        print("Finished envelope; sending final stop command.")
+        if endt > now:
+            await asyncio.sleep(endt - now)
+
+        # final stop command
+        print("Stopping motor")
+        # send the zero twice with a small pause to ensure delivery
         await client.write_gatt_char(BASS_CHAR_UUID, bytes([0]), response=False)
-        print("Audio streaming complete.")
+        await asyncio.sleep(0.1)
+        await client.write_gatt_char(BASS_CHAR_UUID, bytes([0]), response=False)
+        print("Done streaming")
 
 async def play_audio_file(wav_file, playback_event):
-    # wait for BLE connection
     await playback_event.wait()
-    # play on speakers when starting
-    print("Starting local audio playback...")
+    print("Playing audio…")
     subprocess.Popen(["afplay", wav_file])
 
 async def main():
     playback_event = asyncio.Event()
-    wav_file = "Brightside.wav"
-    envelope_values = await stream_bass_envelope(wav_file)
-    if len(envelope_values) > 0:
-        await asyncio.gather(
-            send_envelope_values(envelope_values, playback_event),
-            play_audio_file(wav_file, playback_event)
-        )
-    print("Done sending envelope values.")
+    wav_file = "waves.wav"
 
+    env_vals = await stream_bass_envelope(wav_file)
+    if env_vals.size == 0:
+        return
+
+    t0 = time.monotonic()
+    await asyncio.gather(
+        send_envelope_values(env_vals, playback_event),
+        play_audio_file(wav_file, playback_event)
+    )
+    t1 = time.monotonic()
+    print(f"Session time: {t1-t0:.3f}s")
 
 asyncio.run(main())
+
