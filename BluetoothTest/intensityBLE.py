@@ -5,6 +5,7 @@ import wave
 import numpy as np
 from scipy.signal import butter, lfilter, savgol_filter
 from bleak import BleakClient, BleakScanner
+from playsound import playsound
 
 SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 BASS_CHAR_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
@@ -124,7 +125,8 @@ async def send_envelope_values(env_vals, playback_event):
 async def play_audio_file(wav_file, playback_event):
     await playback_event.wait()
     print("Playing audio…")
-    subprocess.Popen(["afplay", wav_file])
+    # subprocess.Popen(["afplay", wav_file])
+    playsound(wav_file, block=False)
 
 async def main():
     playback_event = asyncio.Event()
